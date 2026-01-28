@@ -7,6 +7,7 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 import netCDF4 as nc
 import xarray as xr
+import fsspec
 
 import sys
 sys.path.insert(1,"../")
@@ -18,15 +19,55 @@ TRUTH_PATH = data_paths["GENERAL"]["TRUTH_PATH"]
 FCST_PATH = data_paths["GENERAL"]["FORECAST_PATH"]
 CONSTANTS_PATH = data_paths["GENERAL"]["CONSTANTS_PATH"]
 
+
+def _truth_file_path(year: str, fname: str) -> str:
+    base = TRUTH_PATH.rstrip("/")
+    if base.startswith("gs://"):
+        return f"{base}/{year}/{fname}.nc"
+    return os.path.join(base, year, f"{fname}.nc")
+
 all_fcst_fields = ['cape', 'cp', 'mcc', 'sp', 'ssr', 't2m', 'tciw', 'tclw', 'tcrw', 'tcw', 'tcwv', 'tp', 'u700', 'v700']
 accumulated_fields = ['cp', 'ssr', 'tp']
 nonnegative_fields = ['cape', 'cp', 'mcc', 'sp', 'ssr', 't2m', 'tciw', 'tclw', 'tcrw', 'tcw', 'tcwv', 'tp']
 
 HOURS = 6  # 6-hr data
 
-ds_truth_test = xr.open_dataset(TRUTH_PATH+'2018/rr_adj_20180107.nc')
-lons_truth = ds_truth_test.Lon.values
-lats_truth = ds_truth_test.Lat.values
+_lons_truth = None
+_lats_truth = None
+
+
+def _load_truth_coords(sample_filename: str | None = None):
+    """
+    Lazily load truth latitude/longitude grids. Uses a sample truth file so we
+    don't fail during module import when the file is missing or paths are
+    misconfigured. Callers should handle FileNotFoundError to surface a clear
+    configuration issue to the user.
+    """
+
+    global _lons_truth, _lats_truth
+    if _lons_truth is not None and _lats_truth is not None:
+        return _lats_truth, _lons_truth
+
+    # Default sample points to the previous hardcoded path unless overridden
+    # (e.g., via an alternate file that actually exists in the bucket).
+    sample_path = sample_filename or os.path.join(TRUTH_PATH, "2018", "rr_adj_20180107.nc")
+
+    try:
+        if sample_path.startswith("gs://"):
+            with fsspec.open(sample_path) as f:
+                ds = xr.open_dataset(f, engine="h5netcdf")
+        else:
+            ds = xr.open_dataset(sample_path)
+        _lons_truth = ds.Lon.values
+        _lats_truth = ds.Lat.values
+        ds.close()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Sample truth file not found. Update TRUTH_PATH in config/data_paths.yaml "
+            f"or provide an existing file (looked for: {sample_path})."
+        ) from exc
+
+    return _lats_truth, _lons_truth
 
 # utility function; generator to iterate over a range of dates
 def daterange(start_date, end_date):
@@ -77,13 +118,20 @@ def get_dates(year,
     for curdate in daterange(start_date, end_date):
         datestr = (curdate+datetime.timedelta(days=1)).strftime('%Y%m%d')
         fname = f"rr_adj_{datestr}"
-        if os.path.exists(os.path.join(TRUTH_PATH, curdate.strftime("%Y"),f"{fname}.nc")):
-            valid_dates.append(curdate.strftime('%Y%m%d'))
+        truth_path = _truth_file_path(curdate.strftime("%Y"), fname)
+        if truth_path.startswith("gs://"):
+            fs = fsspec.filesystem("gs")
+            if fs.exists(truth_path):
+                valid_dates.append(curdate.strftime('%Y%m%d'))
+        else:
+            if os.path.exists(truth_path):
+                valid_dates.append(curdate.strftime('%Y%m%d'))
 
     return valid_dates
 
 def interp_to_rfe(lats,lons,data):
     interp = RegularGridInterpolator((lats, lons), data)
+    lats_truth, lons_truth = _load_truth_coords()
     lats_truth_grid, lons_truth_grid = np.meshgrid(lats_truth, lons_truth, indexing='ij')
     return interp((lats_truth_grid, lons_truth_grid))
     
@@ -102,9 +150,13 @@ def load_truth_and_mask(date,
     fcst_date = datetime.datetime.strptime(date, "%Y%m%d")
     valid_dt = fcst_date + datetime.timedelta(hours=int(time_idx))  # needs to change for 12Z forecasts
     fname = valid_dt.strftime('rr_adj_%Y%m%d')
-    data_path = os.path.join(TRUTH_PATH, valid_dt.strftime('%Y'), f"{fname}.nc")
+    data_path = _truth_file_path(valid_dt.strftime('%Y'), fname)
 
-    ds = xr.open_dataset(data_path)
+    if data_path.startswith("gs://"):
+        with fsspec.open(data_path) as f:
+            ds = xr.open_dataset(f, engine="h5netcdf")
+    else:
+        ds = xr.open_dataset(data_path)
     da = ds["rfev2"]
     y = da.values/24
     ds.close()
@@ -350,11 +402,21 @@ def gen_fcst_norm(year=2018):
     '''
 
     stats_dic = {}
-    fcstnorm_path = os.path.join(CONSTANTS_PATH, f"FCSTNorm{year}.pkl")
+    
+    # Build path compatible with both local and GCS
+    base = CONSTANTS_PATH.rstrip('/')
+    if base.startswith('gs://'):
+        fcstnorm_path = f"{base}/FCSTNorm{year}.pkl"
+    else:
+        fcstnorm_path = os.path.join(base, f"FCSTNorm{year}.pkl")
 
     # make sure we can actually write there, before doing computation!!!
-    with open(fcstnorm_path, 'wb') as f:
-        pickle.dump(stats_dic, f)
+    if fcstnorm_path.startswith('gs://'):
+        with fsspec.open(fcstnorm_path, 'wb') as f:
+            pickle.dump(stats_dic, f)
+    else:
+        with open(fcstnorm_path, 'wb') as f:
+            pickle.dump(stats_dic, f)
 
     for field in all_fcst_fields:
         print(field)
@@ -365,14 +427,30 @@ def gen_fcst_norm(year=2018):
         stats_dic[field]['mean'] = mn
         stats_dic[field]['std'] = sd
 
-    with open(fcstnorm_path, 'wb') as f:
-        pickle.dump(stats_dic, f)
+    # Save final stats file
+    if fcstnorm_path.startswith('gs://'):
+        with fsspec.open(fcstnorm_path, 'wb') as f:
+            pickle.dump(stats_dic, f)
+    else:
+        with open(fcstnorm_path, 'wb') as f:
+            pickle.dump(stats_dic, f)
 
 
 def load_fcst_norm(year=2018):
-    fcstnorm_path = os.path.join(CONSTANTS_PATH, f"FCSTNorm{year}.pkl")
-    with open(fcstnorm_path, 'rb') as f:
-        return pickle.load(f)
+    # Build path compatible with both local and GCS
+    base = CONSTANTS_PATH.rstrip('/')
+    if base.startswith('gs://'):
+        fcstnorm_path = f"{base}/FCSTNorm{year}.pkl"
+    else:
+        fcstnorm_path = os.path.join(base, f"FCSTNorm{year}.pkl")
+    
+    if fcstnorm_path.startswith('gs://'):
+        with fsspec.open(fcstnorm_path, 'rb') as f:
+            return pickle.load(f)
+    else:
+        with open(fcstnorm_path, 'rb') as f:
+            return pickle.load(f)
+
 
 
 try:

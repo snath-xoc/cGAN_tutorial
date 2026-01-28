@@ -46,7 +46,15 @@ KMD_COMPUTER:
 
     TFRecords:
         tfrecords_path: '/home/wrf/Documents/cGAN_tutorial/tfrecords/'
-        
+
+LOCAL_DEV:
+    GENERAL:
+        TRUTH_PATH: 'gs://sewaa-ifs-train/'
+        FORECAST_PATH: 'gs://sewaa-ifs-train/'
+        CONSTANTS_PATH: 'gs://sewaa-ifs-train/constants/'
+
+    TFRecords:
+        tfrecords_path: 'gs://sewaa-ifs-train/tfrecords/'
         
         
 
