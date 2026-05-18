@@ -1,0 +1,27 @@
+  GNU nano 9.0                                                               ./requirements.txt                                                                         
+# Core dependencies for forecast-kmd project
+# Install with: uv pip install -r requirements.txt
+
+# Coiled requirements
+dask
+distributed
+
+# Core packages - tested to work together
+tensorflow==2.15.0
+numpy==1.26.4
+scipy
+xarray
+netCDF4
+h5netcdf
+fsspec
+gcsfs
+pyyaml
+joblib
+h5py
+
+
+# Additional dependencies (may be needed based on your project structure)
+# Uncomment if required:
+# matplotlib
+# pandas
+# scikit-learn
